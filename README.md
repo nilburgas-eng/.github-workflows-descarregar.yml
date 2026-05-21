@@ -1,1 +1,124 @@
-# .github-workflows-descarregar.yml
+name: Descarregar Set
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL del vídeo de YouTube'
+        required: true
+      nom:
+        description: 'Nom del set (ex: david_guetta_ultra_2016)'
+        required: true
+
+jobs:
+  descarregar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Instal·lar dependències
+        run: |
+          pip install yt-dlp google-auth google-auth-oauthlib google-api-python-client
+          sudo apt-get install -y ffmpeg
+          curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+          export NVM_DIR="$HOME/.nvm"
+          [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+          nvm install 20
+          nvm use 20
+          node --version
+
+      - name: Descarregar credencials des del Drive
+        run: |
+          python3 << 'EOF'
+          import requests
+          file_id = "${{ secrets.GDRIVE_FILE_ID }}"
+          url = f"https://drive.google.com/uc?export=download&id={file_id}"
+          r = requests.get(url)
+          with open('credentials.json', 'wb') as f:
+              f.write(r.content)
+          print(f"✅ Credencials descarregades: {len(r.content)} bytes")
+          EOF
+
+      - name: Descarregar cookies des del Drive
+        run: |
+          python3 << 'EOF'
+          from google.oauth2.service_account import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaIoBaseDownload
+          import io
+
+          creds = Credentials.from_service_account_file('credentials.json', scopes=['https://www.googleapis.com/auth/drive'])
+          service = build('drive', 'v3', credentials=creds)
+
+          results = service.files().list(q="name='cookies.txt'", fields="files(id, name)").execute()
+          files = results.get('files', [])
+          if not files:
+              raise Exception("No s'ha trobat cookies.txt al Drive")
+
+          file_id = files[0]['id']
+          request = service.files().get_media(fileId=file_id)
+          with open('cookies.txt', 'wb') as f:
+              downloader = MediaIoBaseDownload(f, request)
+              done = False
+              while not done:
+                  _, done = downloader.next_chunk()
+          print("✅ Cookies descarregades")
+          EOF
+
+      - name: Descarregar vídeo i comentaris
+        run: |
+          export NVM_DIR="$HOME/.nvm"
+          [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+          nvm use 20
+          yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" \
+            --merge-output-format mp4 \
+            --cookies cookies.txt \
+            --js-runtime node \
+            -o "${{ github.event.inputs.nom }}.mp4" \
+            "${{ github.event.inputs.url }}"
+          yt-dlp --write-comments --skip-download \
+            --cookies cookies.txt \
+            --js-runtime node \
+            --output "comments_${{ github.event.inputs.nom }}" \
+            "${{ github.event.inputs.url }}"
+
+      - name: Pujar al Drive
+        run: |
+          python3 << 'EOF'
+          import os
+          import glob
+          from google.oauth2.service_account import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+
+          creds = Credentials.from_service_account_file('credentials.json', scopes=['https://www.googleapis.com/auth/drive'])
+          service = build('drive', 'v3', credentials=creds)
+
+          nom = "${{ github.event.inputs.nom }}"
+
+          # Buscar carpeta onedayonevibe
+          results = service.files().list(
+              q="name='onedayonevibe' and mimeType='application/vnd.google-apps.folder'",
+              fields="files(id, name)"
+          ).execute()
+          files = results.get('files', [])
+          if not files:
+              raise Exception("No s'ha trobat la carpeta onedayonevibe al Drive")
+          parent_id = files[0]['id']
+
+          # Crear carpeta del set
+          folder_metadata = {
+              'name': nom,
+              'mimeType': 'application/vnd.google-apps.folder',
+              'parents': [parent_id]
+          }
+          folder = service.files().create(body=folder_metadata, fields='id').execute()
+          folder_id = folder['id']
+
+          # Pujar fitxers
+          fitxers = [f"{nom}.mp4"] + glob.glob(f"comments_{nom}*.json")
+          for fitxer in fitxers:
+              if os.path.exists(fitxer):
+                  media = MediaFileUpload(fitxer, resumable=True)
+                  file_metadata = {'name': os.path.basename(fitxer), 'parents': [folder_id]}
+                  service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+                  print(f"✅ Pujat: {fitxer}")
+          EOF
